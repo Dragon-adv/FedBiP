@@ -7,7 +7,7 @@ center_crop: false
 random_flip: false
 logging_dir: logs
 mixed_precision: fp16
-report_to: none
+report_to: tensorboard
 local_rank: -1
 max_train_steps:
 gradient_checkpointing: true
@@ -22,7 +22,7 @@ gradient_accumulation_steps: 1
 num_train_epochs: 50
 num_shot: 16
 select: random
-learning_rate: 0.1
+learning_rate: 0.0005
 scale_lr: false
 lr_scheduler: constant
 lr_warmup_steps: 0

@@ -340,6 +340,15 @@ def main():
 
     device=torch.device("cuda")
     print("Start training")
+
+    # 创建 2 个随机噪声用于固定视角的验证
+    val_latents = torch.randn((2, 4, 64, 64), device=accelerator.device, dtype=weight_dtype)
+    val_labels = torch.tensor([0, 1], device=accelerator.device) # 假设测试类别 0 和 1
+    latents_test = []
+    # 简单封装一下以适配 log_validation 的接口预期
+    class MockLatent:
+        def sample(self): return val_latents
+    latents_test = [[MockLatent(), val_labels], [MockLatent(), val_labels]]
     
     for idx, train_dataloader in enumerate(trainloaders):
         prompt_init = []
@@ -483,7 +492,7 @@ def main():
                 plt.close()
 
         if epoch%args.log_every_epochs==0 or epoch==args.num_train_epochs-1:        
-            # log_validation(latents_test, prompt_domain, prompt_class, vae, text_encoder, tokenizer, unet, args, accelerator, noise_scheduler, epoch, num_prompt_class)
+            log_validation(latents_test, prompt_domain, prompt_class, vae, text_encoder, tokenizer, unet, args, accelerator, noise_scheduler, epoch, num_prompt_class)
             if 'concept' in args.train_type:
                 save_model(unet, args.output_dir+'/unet.pth')
             elif 'prompt' in args.train_type:

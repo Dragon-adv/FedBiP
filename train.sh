@@ -29,10 +29,10 @@ do
         --train_type $TRAIN_TYPE \
         --dataset "$DATASET" \
         --num_shot 16 \
-        --learning_rate 0.1 \
+        --learning_rate 5e-4 \
         --mixed_precision "fp16" \
         --gradient_checkpointing \
-        --report_to "none"
+        --report_to "tensorboard"
     
     echo "FINISHED DOMAIN: $domain"
 done
