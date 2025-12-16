@@ -1,3 +1,4 @@
+import platform
 import os
 import torch
 from PIL import Image
@@ -5,6 +6,10 @@ from torch.utils.data import Dataset
 from torchvision import transforms
 import random
 from collections import defaultdict
+
+def identity_transform(x):
+    """可序列化的恒等变换函数，替代lambda函数"""
+    return x
 
 class DomainNetDataset(Dataset):
     def __init__(self, args, domain, split='train', num_shot=-1, 
@@ -19,7 +24,7 @@ class DomainNetDataset(Dataset):
                     [
                         transforms.Resize((args.resolution, args.resolution), interpolation=transforms.InterpolationMode.BILINEAR),
                         transforms.CenterCrop(args.resolution) if args.center_crop else transforms.RandomCrop(args.resolution),
-                        transforms.RandomHorizontalFlip() if args.random_flip else transforms.Lambda(lambda x: x),
+                        transforms.RandomHorizontalFlip() if args.random_flip else transforms.Lambda(identity_transform),
                         transforms.ToTensor(),
                         transforms.Normalize([0.5], [0.5]),
                     ]
@@ -143,7 +148,7 @@ from torch.utils.data import ConcatDataset
 def get_dataloader_domain(args,
         batch_size, transform, split,
         domain, tokenizer, collate_fn, num_shot=-1,
-        num_workers=4, shuffle=True, client_id=None):
+        num_workers=0, shuffle=True, client_id=None):
     dataset = DomainNetDataset(args, 
             domain=domain, 
             num_shot=num_shot, 

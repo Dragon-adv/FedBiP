@@ -1,0 +1,6 @@
+_pycache_/
+_playground_/
+.vscode/
+.cursor/
+exps_pacs/
+test_*/

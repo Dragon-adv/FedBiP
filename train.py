@@ -6,6 +6,10 @@ from pathlib import Path
 from typing import Iterable, Optional
 from tqdm.auto import tqdm
 import json
+
+import matplotlib
+matplotlib.use('Agg')
+
 import matplotlib.pyplot as plt
 from ruamel.yaml import YAML
 
@@ -149,19 +153,21 @@ def log_validation(latents_test, prompt_domain, prompt_class, vae, text_encoder,
                 condition=concepts[i].unsqueeze(0) if concepts is not None else None,
                 img_size=args.resolution))
     
-    for tracker in accelerator.trackers:
-        if tracker.name == "tensorboard":
-            np_images = np.stack([np.asarray(img) for img in images])
-            tracker.writer.add_images("validation", np_images, epoch, dataformats="NHWC")
-        elif tracker.name == 'wandb':
-            images = [np.array(image) for image in images]
-            images = np.concatenate(images, axis=1)
-            pil_image = Image.fromarray(images)
-            downsample_factor = 2
-            downsample_image = pil_image.resize((pil_image.size[0]//downsample_factor, pil_image.size[1]//downsample_factor))
-            tracker.log({"validation_images": wandb.Image(downsample_image)})
-        else:
-            logger.warn(f"image logging not implemented for {tracker.name}")
+    # 仅在主进程且启用了日志记录时执行图像记录
+    if accelerator.is_main_process and args.report_to is not None:
+        for tracker in accelerator.trackers:
+            if tracker.name == "tensorboard":
+                np_images = np.stack([np.asarray(img) for img in images])
+                tracker.writer.add_images("validation", np_images, epoch, dataformats="NHWC")
+            elif tracker.name == 'wandb':
+                images = [np.array(image) for image in images]
+                images = np.concatenate(images, axis=1)
+                pil_image = Image.fromarray(images)
+                downsample_factor = 2
+                downsample_image = pil_image.resize((pil_image.size[0]//downsample_factor, pil_image.size[1]//downsample_factor))
+                tracker.log({"validation_images": wandb.Image(downsample_image)})
+            else:
+                logger.warn(f"image logging not implemented for {tracker.name}")
 
     del model
     torch.cuda.empty_cache()
@@ -174,6 +180,11 @@ def main():
     os.makedirs(args.output_dir, exist_ok=True)
     yaml = YAML()
     yaml.dump(vars(args), open(os.path.join(args.output_dir, 'config.yaml'), 'w'))
+
+    # ==================== [MODIFICATION 1.1: Handle "none" string] ====================
+    if args.report_to == "none":
+        args.report_to = None
+    # ==================================================================================
 
     accelerator = Accelerator(
         gradient_accumulation_steps=args.gradient_accumulation_steps,
@@ -222,7 +233,7 @@ def main():
                 captions.append(random.choice(caption) if is_train else caption[0])
             else:
                 raise ValueError(
-                    f"Caption column `{caption_column}` should contain either strings or lists of strings."
+                    f"Captions should contain either strings or lists of strings."
                 )
         inputs = tokenizer(captions, max_length=tokenizer.model_max_length, padding="do_not_pad", truncation=True)
         input_ids = inputs.input_ids
@@ -253,9 +264,16 @@ def main():
     vae.requires_grad_(False)
     text_encoder.requires_grad_(False)
     unet.requires_grad_(False)
-    text_encoder.to(accelerator.device, dtype=weight_dtype)
-    vae.to(accelerator.device, dtype=weight_dtype)
-    unet.to(accelerator.device)
+    
+    # ==================== [MODIFICATION 2: Fine-grained Dtype for stability] ====================
+    # Text Encoder (FP32 for numerical stability)
+    text_encoder.to(accelerator.device, dtype=torch.float32)
+    # VAE (FP32 for numerical stability)
+    vae.to(accelerator.device, dtype=torch.float32)
+    # UNet (FP16/weight_dtype for low VRAM)
+    unet.to(accelerator.device, dtype=weight_dtype)
+    # ============================================================================================
+
     if args.gradient_checkpointing:
         unet.enable_gradient_checkpointing()
 
@@ -376,8 +394,12 @@ def main():
         for epoch in range(args.num_train_epochs):
             unet.train()
             for step, batch in enumerate(train_dataloader):
-                latents = vae.encode(batch["pixel_values"].to(weight_dtype).to(device)).latent_dist.sample()
+                # ==================== [MODIFICATION 3.1: VAE Encode Data Dtype to FP32] ====================
+                # VAE编码输入像素值为FP32，然后将输出的latents转为FP16 (weight_dtype)
+                latents = vae.encode(batch["pixel_values"].to(device, dtype=torch.float32)).latent_dist.sample()
                 latents = latents * 0.18215
+                latents = latents.to(dtype=weight_dtype) # 转换为UNet所需的FP16
+                # ============================================================================================
 
                 noise = torch.randn_like(latents)
                 bsz = latents.shape[0]
@@ -398,20 +420,34 @@ def main():
                     # A: Because we think the domain concept is not able to be learned since each client has only one domain.
                     encoder_hidden_states = text_encoder(batch["input_ids"].to(device))[0]
                     class_concepts = unet.one_hot_concept[labels] 
-                    batch["input_conditions"] = class_concepts.to(device)
+                    # 确保 input_conditions 转为 FP16
+                    batch["input_conditions"] = class_concepts.to(device, dtype=weight_dtype)
                 elif 'prompt' in args.train_type:
+                    # encoder_hidden_states is output as FP32 from get_prompt_embeddings
                     encoder_hidden_states = get_prompt_embeddings(prompt_domain, prompt_class, labels, tokenizer, text_encoder, num_prompt_class=num_prompt_class)
                     batch["input_conditions"] = None
 
+                # ==================== [MODIFICATION 3.2: UNet Input Dtype - 确保 hidden states 为 FP16] ====================
+                # 将FP32的 encoder_hidden_states 转换为 UNet 所需的 FP16/weight_dtype
                 model_pred = unet(
-                    noisy_latents, timesteps, encoder_hidden_states, 
+                    noisy_latents, 
+                    timesteps, 
+                    encoder_hidden_states.to(dtype=weight_dtype), 
                     controlnet_cond=batch["input_conditions"]).sample
+                # ==============================================================================================================
+                
                 loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
 
                 train_loss += loss.item()
                 curious_time += timesteps.sum().item()
 
                 loss.backward()
+                
+                # ==================== [MODIFICATION 4: Gradient Clipping for stability] ====================
+                if accelerator.sync_gradients:
+                    accelerator.clip_grad_norm_(trainable_params, args.max_grad_norm)
+                # =========================================================================================
+
                 optimizer.step()
                 lr_scheduler.step()
                 optimizer.zero_grad()
@@ -420,7 +456,10 @@ def main():
                 global_step += 1
                 if global_step%1==0:
                     train_loss = train_loss/1
-                    accelerator.log({"train_loss": train_loss, "lr": lr_scheduler.get_last_lr()[0]}, step=global_step)
+                    # ==================== [MODIFICATION 1.2: Conditional logging] ====================
+                    if accelerator.is_main_process and args.report_to is not None:
+                        accelerator.log({"train_loss": train_loss, "lr": lr_scheduler.get_last_lr()[0]}, step=global_step)
+                    # =================================================================================
                     loss_history.append(train_loss)
                     train_loss = 0.0
                     curious_time = 0
