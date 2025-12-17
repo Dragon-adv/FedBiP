@@ -1,8 +1,5 @@
 # FedBiP: Heterogeneous One-Shot Federated Learning with Personalized Latent Diffusion Models
 
-This is the official code repository for the CVPR 2025 paper titled "FedBiP: Heterogeneous One-Shot Federated Learning with Personalized Latent Diffusion Models". Please do not hesitate to reach out for any questions.
-
-
 ## Installation Instructions
 
 This code has been verified with python 3.9 and CUDA version 11.7. To get started, navigate to the `InterpretDiffusion` directory and install the necessary packages using the following commands:
