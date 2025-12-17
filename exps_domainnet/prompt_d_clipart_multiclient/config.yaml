@@ -35,7 +35,7 @@ start_idx: 0
 end_idx: 0
 skip_evaluation: false
 log_every_steps: 50
-log_every_epochs: 5
+log_every_epochs: 1
 prompt: ''
 template_key: '0'
 concept:

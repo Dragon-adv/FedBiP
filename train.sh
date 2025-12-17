@@ -32,7 +32,8 @@ do
         --learning_rate 5e-4 \
         --mixed_precision "fp16" \
         --gradient_checkpointing \
-        --report_to "tensorboard"
+        --report_to "tensorboard" \
+        --log_every_epochs 1 
     
     echo "FINISHED DOMAIN: $domain"
 done

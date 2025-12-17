@@ -1,0 +1,5 @@
+--- STARTING TRAINING RUN (quickdraw) ---
+Debug Log File Path: exps_domainnet/prompt_d_quickdraw_multiclient\validation_debug.log
+Logging Epochs Every: 1
+----------------------------------------------
+[49] --- DEBUG: log_validation called for Epoch 49 ---

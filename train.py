@@ -44,6 +44,18 @@ args = parse_args()
 logger = get_logger(__name__)
 domains = args.domains
 
+# ==================== [File Logging Utility] ====================
+def _write_file_log(message, log_file_path, epoch=None, is_main_process=True):
+    if log_file_path and is_main_process:
+        try:
+            with open(log_file_path, 'a', encoding='utf-8') as f:
+                prefix = f"[{epoch:02d}] " if epoch is not None else ""
+                f.write(f"{prefix}{message}\n")
+        except Exception as e:
+            # Fallback to print if file logging fails, but suppress flush=True for console
+            print(f"File Logging Failed: {e} - Message: {message}") 
+# ================================================================
+
 def get_prompt_embeddings(prompt_domain, prompt_class, labels, tokenizer, 
                           text_encoder, padding_type="do_not_pad", 
                           num_prompt_class=None, num_prompt_domain=None):
@@ -101,24 +113,38 @@ def get_prompt_embeddings(prompt_domain, prompt_class, labels, tokenizer,
 
     return text_f
 
-def log_validation(latents_test, prompt_domain, prompt_class, vae, text_encoder, tokenizer, unet, args, accelerator, scheduler, epoch, num_prompt_class=None):
+def log_validation(latents_test, prompt_domain, prompt_class, vae, text_encoder, tokenizer, unet, args, accelerator, scheduler, epoch, num_prompt_class=None, log_file_path=None):
     categories = args.categories
-    logger.info("Running validation... ")
 
+    # 定义文件写入函数
+    def file_write(message):
+        _write_file_log(message, log_file_path, epoch, accelerator.is_main_process)
+        
+    # --- 关键诊断行：如果这一行都没有写入，说明函数调用本身失败 ---
+    file_write(f"--- DEBUG: log_validation called for Epoch {epoch} ---") 
+    # -------------------------------------------------------------
+        
     device=torch.device('cuda')
 
-    model=StableDiffusionPipeline(
-        vae=vae,
-        text_encoder=text_encoder,
-        tokenizer=tokenizer,
-        unet=unet,
-        scheduler=scheduler,
-        safety_checker=None,
-        feature_extractor=None,
-        requires_safety_checker=False,
-    )
-    model=model.to(device)
-    model.set_progress_bar_config(disable=True)
+    # ========== [FIX: 包装模型初始化和移动到设备的代码块] ==========
+    model = None
+    try:
+        model=StableDiffusionPipeline(
+            vae=vae,
+            text_encoder=text_encoder,
+            tokenizer=tokenizer,
+            unet=unet,
+            scheduler=scheduler,
+            safety_checker=None,
+            feature_extractor=None,
+            requires_safety_checker=False,
+        )
+        model=model.to(device)
+        model.set_progress_bar_config(disable=True)
+    except Exception as e:
+        file_write(f"FATAL ERROR during Pipeline Setup (OOM?): {type(e).__name__}: {e}")
+        return # 如果出错，直接退出函数
+    # =============================================================
 
     def predict_cond(model, latent, prompt, prompt_embds, seed, condition, img_size):
         generator = torch.Generator("cuda").manual_seed(seed)
@@ -154,20 +180,51 @@ def log_validation(latents_test, prompt_domain, prompt_class, vae, text_encoder,
                 img_size=args.resolution))
     
     # 仅在主进程且启用了日志记录时执行图像记录
-    if accelerator.is_main_process and args.report_to is not None:
-        for tracker in accelerator.trackers:
-            if tracker.name == "tensorboard":
-                np_images = np.stack([np.asarray(img) for img in images])
-                tracker.writer.add_images("validation", np_images, epoch, dataformats="NHWC")
-            elif tracker.name == 'wandb':
-                images = [np.array(image) for image in images]
-                images = np.concatenate(images, axis=1)
-                pil_image = Image.fromarray(images)
-                downsample_factor = 2
-                downsample_image = pil_image.resize((pil_image.size[0]//downsample_factor, pil_image.size[1]//downsample_factor))
-                tracker.log({"validation_images": wandb.Image(downsample_image)})
-            else:
-                logger.warn(f"image logging not implemented for {tracker.name}")
+    if accelerator.is_main_process:
+        file_write(f"--- VALIDATION LOGGING START (Epoch {epoch}) ---")
+        
+        # 1. 尝试将图片转换为 Numpy 格式
+        try:
+            np_images = np.stack([np.asarray(img) for img in images])
+        except Exception as e:
+            file_write(f"ERROR: Failed to convert images to numpy: {e}")
+            del model
+            torch.cuda.empty_cache()
+            return
+            
+        if hasattr(accelerator, "trackers"):
+            logged_to_tb = False
+            logged_to_wandb = False
+            
+            # 遍历所有找到的 tracker，并打印名称
+            for idx, tracker in enumerate(accelerator.trackers):
+                file_write(f"DEBUG: Found tracker at index {idx} with name: {tracker.name}")
+
+                if tracker.name.lower() == "tensorboard":
+                    # TensorBoard logging
+                    tracker.writer.add_images("validation", np_images, epoch, dataformats="NHWC")
+                    file_write("SUCCESS: Images logged to TensorBoard writer.")
+                    logged_to_tb = True
+                elif tracker.name.lower() == 'wandb':
+                    # WandB logging
+                    images_log = [np.array(image) for image in images]
+                    images_log = np.concatenate(images_log, axis=1)
+                    pil_image = Image.fromarray(images_log)
+                    downsample_factor = 2
+                    downsample_image = pil_image.resize((pil_image.size[0]//downsample_factor, pil_image.size[1]//downsample_factor))
+                    
+                    # 保持原有的 wandb 记录逻辑
+                    tracker.log({"validation_images": wandb.Image(downsample_image)})
+                    file_write("SUCCESS: Images logged to WandB (if enabled).")
+                    logged_to_wandb = True
+            
+            if not (logged_to_tb or logged_to_wandb):
+                tracker_names = [t.name for t in accelerator.trackers]
+                file_write(f"WARNING: Image logging failed. Available tracker names were: {tracker_names}. Expected 'tensorboard' or 'wandb'.")
+        else:
+            file_write("WARNING: Accelerator has no 'trackers' attribute for image logging. This is unexpected.")
+
+        file_write(f"--- VALIDATION LOGGING END (Epoch {epoch}) ---")
 
     del model
     torch.cuda.empty_cache()
@@ -192,6 +249,18 @@ def main():
         log_with=args.report_to,
         project_dir=logging_dir,
     )
+    
+    # ==================== [FIX: Define LOG_FILE_PATH & Initialize File after accelerator] ====================
+    LOG_FILE_PATH = os.path.join(args.output_dir, 'validation_debug.log')
+    if args.report_to != "none":
+        if accelerator.is_main_process:
+            with open(LOG_FILE_PATH, 'w') as f:
+                f.write(f"--- STARTING TRAINING RUN ({args.domain}) ---\n")
+                f.write(f"Debug Log File Path: {LOG_FILE_PATH}\n")
+                f.write(f"Logging Epochs Every: {args.log_every_epochs}\n")
+                f.write("----------------------------------------------\n")
+    # =======================================================================================================
+
 
     logging.basicConfig(
         format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
@@ -204,6 +273,23 @@ def main():
 
     if accelerator.is_main_process:
         os.makedirs(args.output_dir, exist_ok=True)
+        # ==================== [FIX 2: Config Sanitization and Tracker Initialization] ====================
+        # 创建一个清洗后的配置字典，只保留 TensorBoard 支持的类型，其他的转为字符串
+        sanitized_config = {}
+        for k, v in vars(args).items():
+            # 如果是合法的类型，直接保留
+            if isinstance(v, (int, float, str, bool, torch.Tensor)):
+                sanitized_config[k] = v
+            # 如果是 None，转为字符串 "None"
+            elif v is None:
+                sanitized_config[k] = "None"
+            # 其他类型（如 list, dict 等），直接转为字符串表示
+            else:
+                sanitized_config[k] = str(v)
+
+        # 使用清洗后的配置启动 trackers，这将解决ValueError和图片日志缺失的问题
+        accelerator.init_trackers("fedbip_experiment", config=sanitized_config)
+        # =================================================================================================
 
     tokenizer = CLIPTokenizer.from_pretrained(
         args.pretrained_model_name_or_path, subfolder="tokenizer", revision=args.revision
@@ -465,10 +551,11 @@ def main():
                 global_step += 1
                 if global_step%1==0:
                     train_loss = train_loss/1
-                    # ==================== [MODIFICATION 1.2: Conditional logging] ====================
-                    if accelerator.is_main_process and args.report_to is not None:
+                    # ==================== [FIX 3: Robust Conditional logging check in main loop] ====================
+                    # Scalar logging uses the accelerator built-in log mechanism
+                    if accelerator.is_main_process and hasattr(accelerator, "trackers"):
                         accelerator.log({"train_loss": train_loss, "lr": lr_scheduler.get_last_lr()[0]}, step=global_step)
-                    # =================================================================================
+                    # ================================================================================================
                     loss_history.append(train_loss)
                     train_loss = 0.0
                     curious_time = 0
@@ -478,12 +565,13 @@ def main():
 
                 if global_step >= args.max_train_steps:
                     break
-
+                
                 if not args.skip_evaluation and (global_step)%args.log_every_steps==0:
                     if 'concept' in args.train_type:
                         save_model(unet, args.output_dir+'/unet.pth')
                     elif 'prompt' in args.train_type:
                         torch.save(prompt_domain, args.output_dir+f'/prompt_domain_{idx}.pth')
+                    elif 'prompt' in args.train_type:
                         torch.save(prompt_class, args.output_dir+f'/prompt_class_{idx}.pth')
 
                 plt.figure()
@@ -491,14 +579,19 @@ def main():
                 plt.savefig(args.output_dir+'/loss_history.png')
                 plt.close()
 
+        # 强制在控制台输出提示信息 (使用 progress_bar.write 绕过 tqdm 干扰)
+        if accelerator.is_main_process and (epoch % args.log_every_epochs == 0 or epoch == args.num_train_epochs - 1):
+            progress_bar.write(f"--- EPOCH {epoch} END: Triggering Validation... ---", end='\n')
+
         if epoch%args.log_every_epochs==0 or epoch==args.num_train_epochs-1:        
-            log_validation(latents_test, prompt_domain, prompt_class, vae, text_encoder, tokenizer, unet, args, accelerator, noise_scheduler, epoch, num_prompt_class)
+            # 在调用 log_validation 时传入 log_file_path
+            log_validation(latents_test, prompt_domain, prompt_class, vae, text_encoder, tokenizer, unet, args, accelerator, noise_scheduler, epoch, num_prompt_class, log_file_path=LOG_FILE_PATH)
             if 'concept' in args.train_type:
                 save_model(unet, args.output_dir+'/unet.pth')
             elif 'prompt' in args.train_type:
                 torch.save(prompt_domain, args.output_dir+f'/prompt_domain_{idx}.pth')
+            elif 'prompt' in args.train_type:
                 torch.save(prompt_class, args.output_dir+f'/prompt_class_{idx}.pth')
 
 if __name__ == "__main__":
     main()
-# First use CLIP-Inversion to augment the training data?
