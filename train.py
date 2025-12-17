@@ -72,7 +72,8 @@ def get_prompt_embeddings(prompt_domain, prompt_class, labels, tokenizer,
         return_tensors="pt"
     )
     input_ids = torch.LongTensor(inputs.input_ids)
-    text_f = text_encoder(input_ids.to('cuda'))[0]
+    te_device = next(text_encoder.parameters()).device
+    text_f = text_encoder(input_ids.to(te_device))[0]
     if args.dataset in ['bloodmnist', 'dermamnist', 'ucm']:
         st_idx_map_class = {
             'bloodmnist': 7,
@@ -152,7 +153,7 @@ def log_validation(latents_test, prompt_domain, prompt_class, vae, text_encoder,
                 condition=concepts[i].unsqueeze(0) if concepts is not None else None,
                 img_size=args.resolution))
     
-    for tracker in accelerator.trackers:
+    for tracker in getattr(accelerator, "trackers", []):
         if tracker.name == "tensorboard":
             np_images = np.stack([np.asarray(img) for img in images])
             tracker.writer.add_images("validation", np_images, epoch, dataformats="NHWC")
@@ -178,10 +179,19 @@ def main():
     yaml = YAML()
     yaml.dump(vars(args), open(os.path.join(args.output_dir, 'config.yaml'), 'w'))
 
+    # Ensure TensorBoard is enabled for image validation.
+    log_with = args.report_to
+    if isinstance(log_with, str):
+        log_with = [x.strip() for x in log_with.split(",") if x.strip()]
+    if not log_with:
+        log_with = []
+    if "tensorboard" not in log_with:
+        log_with.append("tensorboard")
+
     accelerator = Accelerator(
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         mixed_precision=args.mixed_precision,
-        log_with=args.report_to,
+        log_with=log_with,
         project_dir=logging_dir,
     )
 
@@ -196,6 +206,10 @@ def main():
 
     if accelerator.is_main_process:
         os.makedirs(args.output_dir, exist_ok=True)
+
+    # Create trackers (required for tensorboard image logging via accelerator.trackers)
+    if accelerator.is_main_process and log_with:
+        accelerator.init_trackers(project_name="FedBiP", config=vars(args))
 
     tokenizer = CLIPTokenizer.from_pretrained(
         args.pretrained_model_name_or_path, subfolder="tokenizer", revision=args.revision
@@ -406,6 +420,29 @@ def main():
         prompt_class.requires_grad_(True)
         trainable_params = [prompt_domain, prompt_class]    
 
+        # ------------------------------------------------------------
+        # Build a fixed validation batch (latents_test) from client_0.
+        # - take 2 batches from trainloaders[0]
+        # - store (latent_dist, class_ids) without sampling here
+        # ------------------------------------------------------------
+        latents_test = []
+        with torch.no_grad():
+            it = iter(trainloaders[0])
+            for _ in range(2):
+                try:
+                    vb = next(it)
+                except StopIteration:
+                    break
+                pv = vb["pixel_values"].to(accelerator.device, dtype=weight_dtype)
+                latent_dist = vae.encode(pv).latent_dist
+                class_ids = vb["class_ids"].to(accelerator.device)
+                latents_test.append((latent_dist, class_ids))
+        if len(latents_test) < 2:
+            logger.warning(
+                f"Validation set has only {len(latents_test)} batch(es); expected 2. "
+                "TensorBoard image validation may be skipped."
+            )
+
         optimizer = torch.optim.Adam(
                 trainable_params, # only the weight of MLP will be opitmized
                 lr=args.learning_rate,
@@ -497,7 +534,21 @@ def main():
                 plt.close()
 
         if epoch%args.log_every_epochs==0 or epoch==args.num_train_epochs-1:        
-            # log_validation(latents_test, prompt_domain, prompt_class, vae, text_encoder, tokenizer, unet, args, accelerator, noise_scheduler, epoch, num_prompt_class)
+            if len(latents_test) >= 1:
+                log_validation(
+                    latents_test,
+                    prompt_domain,
+                    prompt_class,
+                    vae,
+                    text_encoder,
+                    tokenizer,
+                    unet,
+                    args,
+                    accelerator,
+                    noise_scheduler,
+                    epoch,
+                    num_prompt_class,
+                )
             if 'concept' in args.train_type:
                 save_model(unet, os.path.join(args.output_dir, "unet.pth"))
             elif 'prompt' in args.train_type:
