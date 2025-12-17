@@ -2,7 +2,8 @@ DATASET='domainnet'
 if [[ "$DATASET" == "officehome" ]]; then
     domains=("Art" "Clipart" "Product" "Real")
 elif [[ $DATASET == "domainnet" ]]; then
-    domains=("clipart" "infograph" "painting" "quickdraw" "real" "sketch")
+    domains=("real")
+    # domains=("clipart" "infograph" "painting" "quickdraw" "real" "sketch")
 elif [[ $DATAET == "pacs" ]]; then
     domains=("photo" "sketch" "art_painting" "cartoon")
 else

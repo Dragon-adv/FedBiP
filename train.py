@@ -168,6 +168,8 @@ def log_validation(latents_test, prompt_domain, prompt_class, vae, text_encoder,
         elif 'prompt' in args.train_type:
             concepts = None
             prompt_embds = get_prompt_embeddings(prompt_domain, prompt_class, labels, tokenizer, text_encoder, padding_type="max_length", num_prompt_class=num_prompt_class)
+            if prompt_embds is not None:
+                prompt_embds = prompt_embds.to(dtype=unet.dtype) # 强制转换类型
             bsz = latents.shape[0]
 
         for i in range(bsz):
