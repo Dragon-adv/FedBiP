@@ -1,2 +1,9 @@
+# 忽略所有的 pycache
 **/__pycache__/
 *.py[cod]
+
+# 忽略任何路径下的 logs 文件夹
+**/logs/
+
+# 忽略所有 TensorBoard 事件文件
+*.tfevents.*
