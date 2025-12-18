@@ -25,11 +25,13 @@ for domain in "${domains[@]}"; do
         --output_dir "${EXPS_ROOT}/${TRAIN_TYPE}_d_${domain}_multiclient" \
         --evaluation_type generate \
         --num_train_epochs 50 \
-        --train_batch_size 1 \
+        --train_batch_size 4 \
+        --gradient_accumulation_steps 1 \
         --mixed_precision bf16 \
         --domain "$domain" \
         --train_type "$TRAIN_TYPE" \
         --dataset "$DATASET" \
         --num_shot 16 \
-        --learning_rate 0.1
+        --learning_rate 0.1 \
+        --num_workers 0
 done

@@ -16,7 +16,7 @@ def parse_args():
     parser.add_argument("--random_flip", action="store_true", help="whether to randomly flip images horizontally",)
     parser.add_argument("--logging_dir", type=str, default=os.path.join("logs"))
     parser.add_argument("--mixed_precision",type=str,default="bf16",choices=["no", "fp16", "bf16"],)
-    parser.add_argument("--report_to",type=str,default="wandb",)
+    parser.add_argument("--report_to",type=str,default="tensorboard",)
     parser.add_argument("--local_rank", type=int, default=-1, help="For distributed training: local_rank")
     parser.add_argument("--max_train_steps",type=int,default=None,)
     parser.add_argument("--gradient_checkpointing", action="store_true",)

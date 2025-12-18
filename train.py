@@ -157,6 +157,11 @@ def log_validation(latents_test, prompt_domain, prompt_class, vae, text_encoder,
         if tracker.name == "tensorboard":
             np_images = np.stack([np.asarray(img) for img in images])
             tracker.writer.add_images("validation", np_images, epoch, dataformats="NHWC")
+            # Make sure images are visible in TensorBoard during training (avoid long buffering).
+            try:
+                tracker.writer.flush()
+            except Exception:
+                pass
         elif tracker.name == 'wandb':
             images = [np.array(image) for image in images]
             images = np.concatenate(images, axis=1)
@@ -169,6 +174,34 @@ def log_validation(latents_test, prompt_domain, prompt_class, vae, text_encoder,
 
     del model
     torch.cuda.empty_cache()
+
+def _log_batch_images_to_tensorboard(accelerator, tag: str, pixel_values: torch.Tensor, step: int) -> None:
+    """
+    Log a batch of normalized training images (-1..1) to TensorBoard as a quick sanity check.
+    This is lightweight compared to full diffusion sampling and ensures the Images tab is populated early.
+    """
+    if not accelerator.is_main_process:
+        return
+    trackers = getattr(accelerator, "trackers", None) or []
+    if not trackers:
+        return
+    # pixel_values: (B, C, H, W) in [-1, 1]
+    imgs = (pixel_values.detach().float().clamp(-1, 1) * 0.5 + 0.5).clamp(0, 1).cpu()
+    for tracker in trackers:
+        # NOTE:
+        # - accelerate's tensorboard tracker is usually named "tensorboard"
+        # - but to be robust across versions / forks, key off the presence of a SummaryWriter-like API.
+        writer = getattr(tracker, "writer", None)
+        if writer is None:
+            continue
+        add_images = getattr(writer, "add_images", None)
+        if add_images is None:
+            continue
+        add_images(tag, imgs, step)
+        try:
+            writer.flush()
+        except Exception:
+            pass
 
 
 def main():
@@ -209,7 +242,13 @@ def main():
 
     # Create trackers (required for tensorboard image logging via accelerator.trackers)
     if accelerator.is_main_process and log_with:
-        accelerator.init_trackers(project_name="FedBiP", config=vars(args))
+        # fix: convert list arguments to string for tensorboard compatibility
+        config_dict = vars(args).copy()
+        for key, value in config_dict.items():
+            if isinstance(value, (list, tuple)):
+                config_dict[key] = str(value)
+        
+        accelerator.init_trackers(project_name="FedBiP", config=config_dict)
 
     tokenizer = CLIPTokenizer.from_pretrained(
         args.pretrained_model_name_or_path, subfolder="tokenizer", revision=args.revision
@@ -518,42 +557,54 @@ def main():
                 logs = {"step_loss": loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0]}
                 progress_bar.set_postfix(**logs)
 
-                if global_step >= args.max_train_steps:
-                    break
-
-                if not args.skip_evaluation and (global_step)%args.log_every_steps==0:
+                # Log a quick preview batch to TensorBoard early so the Images tab is never empty.
+                # Also keep periodic logging cadence controlled by log_every_steps.
+                if (not args.skip_evaluation) and (
+                    global_step == 1 or (args.log_every_steps and global_step % args.log_every_steps == 0)
+                ):
+                    # Populate TensorBoard Images early (so you don't need to wait for epoch end).
+                    _log_batch_images_to_tensorboard(
+                        accelerator,
+                        tag="train_samples",
+                        pixel_values=batch["pixel_values"],
+                        step=global_step,
+                    )
                     if 'concept' in args.train_type:
                         save_model(unet, os.path.join(args.output_dir, "unet.pth"))
                     elif 'prompt' in args.train_type:
                         torch.save(prompt_domain, os.path.join(args.output_dir, f"prompt_domain_{idx}.pth"))
                         torch.save(prompt_class, os.path.join(args.output_dir, f"prompt_class_{idx}.pth"))
 
+                if global_step >= args.max_train_steps:
+                    break
+
                 plt.figure()
                 plt.plot(loss_history)
                 plt.savefig(os.path.join(args.output_dir, "loss_history.png"))
                 plt.close()
 
-        if epoch%args.log_every_epochs==0 or epoch==args.num_train_epochs-1:        
-            if len(latents_test) >= 1:
-                log_validation(
-                    latents_test,
-                    prompt_domain,
-                    prompt_class,
-                    vae,
-                    text_encoder,
-                    tokenizer,
-                    unet,
-                    args,
-                    accelerator,
-                    noise_scheduler,
-                    epoch,
-                    num_prompt_class,
-                )
-            if 'concept' in args.train_type:
-                save_model(unet, os.path.join(args.output_dir, "unet.pth"))
-            elif 'prompt' in args.train_type:
-                torch.save(prompt_domain, os.path.join(args.output_dir, f"prompt_domain_{idx}.pth"))
-                torch.save(prompt_class, os.path.join(args.output_dir, f"prompt_class_{idx}.pth"))
+            # Epoch-end validation / checkpointing (was incorrectly indented outside the epoch loop before).
+            if (not args.skip_evaluation) and (epoch % args.log_every_epochs == 0 or epoch == args.num_train_epochs - 1):
+                if len(latents_test) >= 1:
+                    log_validation(
+                        latents_test,
+                        prompt_domain,
+                        prompt_class,
+                        vae,
+                        text_encoder,
+                        tokenizer,
+                        unet,
+                        args,
+                        accelerator,
+                        noise_scheduler,
+                        epoch,
+                        num_prompt_class,
+                    )
+                if 'concept' in args.train_type:
+                    save_model(unet, os.path.join(args.output_dir, "unet.pth"))
+                elif 'prompt' in args.train_type:
+                    torch.save(prompt_domain, os.path.join(args.output_dir, f"prompt_domain_{idx}.pth"))
+                    torch.save(prompt_class, os.path.join(args.output_dir, f"prompt_class_{idx}.pth"))
 
         # ------------------------------------------------------------
         # Latent statistics (mean/std) for FedBiP generation stage.
@@ -581,6 +632,12 @@ def main():
 
         # Prevent CUDA memory accumulation across clients.
         torch.cuda.empty_cache()
+
+    # Close trackers and flush remaining events (helps TensorBoard update promptly).
+    try:
+        accelerator.end_training()
+    except Exception:
+        pass
 
 if __name__ == "__main__":
     main()

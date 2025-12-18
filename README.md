@@ -34,13 +34,13 @@ bash generate.sh
 bash clf_train.sh
 ```
 
-## Citing our work
-If our work has contributed to your research, we would greatly appreciate an acknowledgement by citing us as follows:
+---
+
+查看中间过程图片：
+
+```bash
+ tensorboard --logdir exps_domainnet/prompt_d_clipart_multiclient/logs/FedBiP
 ```
-@article{chen2024fedbip,
-  title={Fedbip: Heterogeneous one-shot federated learning with personalized latent diffusion models},
-  author={Chen, Haokun and Li, Hang and Zhang, Yao and Bi, Jinhe and Zhang, Gengyuan and Zhang, Yueqi and Torr, Philip and Gu, Jindong and Krompass, Denis and Tresp, Volker},
-  journal={arXiv preprint arXiv:2410.04810},
-  year={2024}
-}
- 
+
+
+
